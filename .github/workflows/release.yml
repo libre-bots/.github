@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump.
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      prerelease:
+        description: Create a release candidate.
+        type: boolean
+        default: false
+
+concurrency: release
+
+permissions: {}
+
+jobs:
+  prepare:
+    permissions:
+      contents: write
+      checks: read
+      packages: write
+    uses: ./.github/workflows/release-prepare.yml # zizmor: ignore[self-repository]
+    with:
+      bump: ${{ inputs.bump }}
+      prerelease: ${{ inputs.prerelease }}
+
+  finish:
+    needs: prepare
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/release-finish.yml # zizmor: ignore[self-repository]
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+      version: ${{ needs.prepare.outputs.version }}
+      python-version: ${{ needs.prepare.outputs.python-version }}
+      previous-tag: ${{ needs.prepare.outputs.previous-tag }}
+      prerelease: ${{ needs.prepare.outputs.prerelease }}
+      images: ${{ needs.prepare.outputs.images }}

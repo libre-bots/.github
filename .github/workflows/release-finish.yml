@@ -1,0 +1,262 @@
+name: Release finish
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Git tag of the release, as release-prepare outputs it.
+        type: string
+        required: true
+      version:
+        description: Release version without the leading v.
+        type: string
+        required: true
+      python-version:
+        description: Release version in the form Python packages use.
+        type: string
+        required: true
+      previous-tag:
+        description: Tag of the previous release, empty when there is none.
+        type: string
+        default: ""
+      prerelease:
+        description: The string true for a release candidate, otherwise false.
+        type: string
+        required: true
+      images:
+        description: JSON object mapping each image name to its digest, {} when there are none.
+        type: string
+        default: "{}"
+      python-distributions:
+        description: Names of the Python distributions that were published to PyPI, one per line.
+        type: string
+        default: ""
+
+permissions: {}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      images: ${{ steps.plan.outputs.images }}
+    steps:
+      - name: Check the prerelease flag
+        env:
+          PRERELEASE: ${{ inputs.prerelease }}
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::tag is '$TAG' but version '$VERSION' requires 'v$VERSION'."
+            exit 1
+          fi
+          if [ "$PRERELEASE" != "true" ] && [ "$PRERELEASE" != "false" ]; then
+            echo "::error::prerelease must be exactly true or false, not '$PRERELEASE'."
+            exit 1
+          fi
+          case "$VERSION" in
+            *-*) expected=true ;;
+            *) expected=false ;;
+          esac
+          if [ "$PRERELEASE" != "$expected" ]; then
+            echo "::error::prerelease is '$PRERELEASE' but version '$VERSION' implies '$expected'."
+            exit 1
+          fi
+
+      - name: Build the image list
+        id: plan
+        env:
+          IMAGES: ${{ inputs.images }}
+        run: |
+          if ! images=$(jq -ce '
+            if type == "object"
+              and all(keys[]; test("\\A[a-z0-9][a-z0-9._-]*\\z"))
+              and all(.[]; type == "string" and test("\\Asha256:[0-9a-f]{64}\\z"))
+            then to_entries | map({name: .key, digest: .value}) else error("invalid") end' <<< "$IMAGES" 2> /dev/null); then
+            echo "::error::images must be a JSON object mapping image names matching ^[a-z0-9][a-z0-9._-]*$ to sha256 digests."
+            exit 1
+          fi
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+
+  images:
+    needs: plan
+    if: ${{ needs.plan.outputs.images != '[]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: true
+      matrix:
+        image: ${{ fromJSON(needs.plan.outputs.images) }}
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Attest the build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/${{ matrix.image.name }}
+          subject-digest: ${{ matrix.image.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Add the image tags
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image.name }}
+          DIGEST: ${{ matrix.image.digest }}
+          VERSION: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          tags=(-t "$IMAGE:$VERSION")
+          if [ "$PRERELEASE" != "true" ]; then
+            tags+=(-t "$IMAGE:${VERSION%.*}" -t "$IMAGE:latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" "$IMAGE@$DIGEST"
+
+  release:
+    needs: [plan, images]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.images.result) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Write the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          TAG: ${{ inputs.tag }}
+          PREVIOUS_TAG: ${{ inputs.previous-tag }}
+          VERSION: ${{ inputs.version }}
+          PYTHON_VERSION: ${{ inputs.python-version }}
+          IMAGES: ${{ inputs.images }}
+          DISTRIBUTIONS: ${{ inputs.python-distributions }}
+        run: |
+          args=(-f "tag_name=$TAG")
+          if [ -n "$PREVIOUS_TAG" ]; then
+            args+=(-f "previous_tag_name=$PREVIOUS_TAG")
+          fi
+          gh api -X POST "repos/$REPO/releases/generate-notes" "${args[@]}" --jq .body > notes.md
+
+          {
+            if jq -e 'length > 0' <<< "$IMAGES" > /dev/null; then
+              printf '\n## Images\n\n'
+              jq -r --arg owner "$OWNER" --arg version "$VERSION" \
+                'to_entries[] | "- `ghcr.io/\($owner)/\(.key):\($version)@\(.value)`"' <<< "$IMAGES"
+            fi
+            if printf '%s\n' "$DISTRIBUTIONS" | grep -q '[^[:space:]]'; then
+              printf '\n## Python packages\n\n'
+              printf '%s\n' "$DISTRIBUTIONS" | while read -r dist; do
+                [ -n "$dist" ] || continue
+                printf -- "- \`pip install %s==%s\`\n" "$dist" "$PYTHON_VERSION"
+              done
+            fi
+          } >> notes.md
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          flags=()
+          if [ "$PRERELEASE" = "true" ]; then
+            flags+=(--prerelease)
+          fi
+          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$REPO" --title "$TAG" --notes-file notes.md "${flags[@]}"
+          else
+            gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" --notes-file notes.md "${flags[@]}"
+          fi
+
+  verify:
+    needs: [plan, release]
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    steps:
+      - name: Set up Python
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          python-version: "3.12"
+          version: "0.13.10"
+          enable-cache: false
+
+      - name: Install the distributions from PyPI
+        env:
+          DISTRIBUTIONS: ${{ inputs.python-distributions }}
+          PYTHON_VERSION: ${{ inputs.python-version }}
+        run: |
+          printf '%s\n' "$DISTRIBUTIONS" | while read -r dist; do
+            [ -n "$dist" ] || continue
+            venv="$RUNNER_TEMP/verify-$dist"
+            uv venv --python 3.12 "$venv"
+            installed=false
+            for attempt in $(seq 1 21); do
+              if uv pip install --refresh --python "$venv/bin/python" "$dist==$PYTHON_VERSION"; then
+                installed=true
+                break
+              fi
+              if [ "$attempt" -lt 21 ]; then
+                echo "Attempt $attempt of 21 failed, retrying in 15 seconds."
+                sleep 15
+              fi
+            done
+            if [ "$installed" != "true" ]; then
+              echo "::error::$dist==$PYTHON_VERSION could not be installed from PyPI within 5 minutes."
+              exit 1
+            fi
+            reported=$("$venv/bin/python" -c 'import importlib.metadata, sys; print(importlib.metadata.version(sys.argv[1]))' "$dist")
+            if [ "$reported" != "$PYTHON_VERSION" ]; then
+              echo "::error::$dist is installed as '$reported', expected '$PYTHON_VERSION'."
+              exit 1
+            fi
+          done
+
+      - name: Set up QEMU
+        if: ${{ needs.plan.outputs.images != '[]' }}
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          cache-image: false
+
+      - name: Log in to ghcr.io
+        if: ${{ needs.plan.outputs.images != '[]' }}
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Run the images
+        if: ${{ needs.plan.outputs.images != '[]' }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+          IMAGES: ${{ inputs.images }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          jq -r 'to_entries[] | "\(.key) \(.value)"' <<< "$IMAGES" | while read -r name digest; do
+            resolved=$(docker buildx imagetools inspect "ghcr.io/$OWNER/$name:$VERSION" --format '{{.Manifest.Digest}}')
+            if [ "$resolved" != "$digest" ]; then
+              echo "::error::ghcr.io/$OWNER/$name:$VERSION resolves to '$resolved', expected '$digest'."
+              exit 1
+            fi
+            for platform in linux/amd64 linux/arm64; do
+              reported=$(docker run --rm --platform "$platform" "ghcr.io/$OWNER/$name@$digest" version)
+              if [ "$reported" != "$VERSION" ]; then
+                echo "::error::ghcr.io/$OWNER/$name@$digest on $platform reports version '$reported', expected '$VERSION'."
+                exit 1
+              fi
+            done
+          done

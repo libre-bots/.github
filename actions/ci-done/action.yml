@@ -1,0 +1,23 @@
+name: CI Done
+description: Passes only when at least one job is given and every job succeeded or was skipped; anything else fails.
+inputs:
+  needs:
+    description: The needs context of the calling job, passed as ${{ toJSON(needs) }}.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Check job results
+      shell: bash
+      env:
+        NEEDS: ${{ inputs.needs }}
+      run: |
+        if ! jq -e 'type == "object" and length > 0 and all(.[]; type == "object")' <<< "$NEEDS" > /dev/null 2>&1; then
+          echo "error: the needs input is not a non-empty JSON object of jobs" >&2
+          exit 1
+        fi
+        jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS"
+        if ! jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<< "$NEEDS" > /dev/null; then
+          echo "error: at least one job did not succeed" >&2
+          exit 1
+        fi

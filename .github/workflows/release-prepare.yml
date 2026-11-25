@@ -1,0 +1,383 @@
+name: Release prepare
+
+on:
+  workflow_call:
+    inputs:
+      bump:
+        description: Version bump, one of patch, minor or major; required for the semver scheme and ignored for calver.
+        type: string
+        default: ""
+      prerelease:
+        description: Whether to create a release candidate.
+        type: boolean
+        required: true
+      scheme:
+        description: Version scheme, semver or calver.
+        type: string
+        default: semver
+      python-projects:
+        description: Python packages to build, one path:import.name per line, for example clients/python:librebots.hub.
+        type: string
+        default: ""
+      images:
+        description: Container images to build, a JSON list of objects with name, context and an optional file; context and file are relative to the repository root.
+        type: string
+        default: "[]"
+    outputs:
+      tag:
+        description: Git tag that was created for the release.
+        value: ${{ jobs.preflight.outputs.tag }}
+      version:
+        description: Release version without the leading v.
+        value: ${{ jobs.preflight.outputs.version }}
+      python-version:
+        description: Release version in the form Python packages use.
+        value: ${{ jobs.preflight.outputs.python-version }}
+      previous-tag:
+        description: Tag of the previous release, empty when there is none.
+        value: ${{ jobs.preflight.outputs.previous-tag }}
+      prerelease:
+        description: true when the release is a release candidate.
+        value: ${{ jobs.preflight.outputs.prerelease }}
+      images:
+        description: JSON object mapping each image name to the digest that was pushed.
+        value: ${{ jobs.images-collect.outputs.images }}
+
+permissions: {}
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      python-version: ${{ steps.version.outputs.python-version }}
+      previous-tag: ${{ steps.version.outputs.previous-tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      projects: ${{ steps.projects.outputs.projects }}
+      images: ${{ steps.images.outputs.images }}
+    steps:
+      - name: Require the main branch
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::Releases run only on refs/heads/main, not on $REF."
+            exit 1
+          fi
+
+      - name: Require a green CI Done
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          state=$(gh api "repos/$REPO/commits/$SHA/check-runs?check_name=CI%20Done&app_id=15368" \
+            --jq '.check_runs | max_by(.id) | if . == null then "missing" else "\(.status) \(.conclusion)" end')
+          if [ "$state" != "completed success" ]; then
+            echo "::error::The check run CI Done on $SHA is not green (state: $state)."
+            exit 1
+          fi
+
+      - name: Check out the caller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the shared workflow source
+        env:
+          WORKFLOW_REPOSITORY: ${{ fromJSON(toJSON(job)).workflow_repository }}
+          WORKFLOW_SHA: ${{ fromJSON(toJSON(job)).workflow_sha }}
+        run: |
+          if [ -z "$WORKFLOW_REPOSITORY" ] || [ -z "$WORKFLOW_SHA" ]; then
+            echo "::error::The job context has no workflow_repository or workflow_sha, so the shared scripts cannot be checked out."
+            exit 1
+          fi
+
+      - name: Check out the shared scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # actionlint 1.7.12 does not know these job properties yet.
+          repository: ${{ fromJSON(toJSON(job)).workflow_repository }}
+          ref: ${{ fromJSON(toJSON(job)).workflow_sha }}
+          path: .shared
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          python-version: "3.12"
+          version: "0.13.10"
+          enable-cache: false
+
+      - name: Compute the version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          SCHEME: ${{ inputs.scheme }}
+        run: |
+          args=(--bump "$BUMP" --scheme "$SCHEME")
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          uv run --no-project python .shared/scripts/next_version.py "${args[@]}"
+
+      - name: Build the Python matrix
+        id: projects
+        env:
+          PROJECTS: ${{ inputs.python-projects }}
+        run: |
+          projects=$(printf '%s\n' "$PROJECTS" | jq -Rsc '
+            split("\n")
+            | map(select(test("\\S")) | gsub("^\\s+|\\s+$"; ""))
+            | to_entries
+            | map({index: .key, path: (.value | split(":")[0]), import: (.value | split(":")[1:] | join(":"))})')
+          if jq -e 'any(.[]; .path == "" or .import == "")' <<< "$projects" > /dev/null; then
+            echo "::error::Every line of python-projects must look like path:import.name."
+            exit 1
+          fi
+          echo "projects=$projects" >> "$GITHUB_OUTPUT"
+
+      - name: Validate the images
+        id: images
+        env:
+          IMAGES: ${{ inputs.images }}
+        run: |
+          if ! images=$(jq -ce '
+            if type == "array" and all(.[]; type == "object"
+              and (.name | type == "string" and test("\\A[a-z0-9][a-z0-9._-]*\\z"))
+              and (.context | type == "string" and length > 0)
+              and ((has("file") | not) or (.file | type == "string" and length > 0)))
+              and (map(.name) | length == (unique | length))
+            then . else error("invalid") end' <<< "$IMAGES" 2> /dev/null); then
+            echo "::error::images must be a JSON array of objects with unique names matching ^[a-z0-9][a-z0-9._-]*$, a non-empty context and, when present, a non-empty file."
+            exit 1
+          fi
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+
+  python:
+    needs: preflight
+    if: ${{ needs.preflight.outputs.projects != '[]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        project: ${{ fromJSON(needs.preflight.outputs.projects) }}
+    steps:
+      - name: Check out the caller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          python-version: "3.12"
+          version: "0.13.10"
+          enable-cache: false
+
+      - name: Set the version and build
+        working-directory: ${{ matrix.project.path }}
+        env:
+          PYTHON_VERSION: ${{ needs.preflight.outputs.python-version }}
+          OUT_DIR: ${{ github.workspace }}/dist/${{ matrix.project.index }}
+        run: |
+          uv version "$PYTHON_VERSION" --frozen
+          uv build --out-dir "$OUT_DIR"
+
+      - name: Install the wheel and import it
+        env:
+          OUT_DIR: ${{ github.workspace }}/dist/${{ matrix.project.index }}
+          IMPORT_NAME: ${{ matrix.project.import }}
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/check-venv"
+          uv pip install --python "$RUNNER_TEMP/check-venv/bin/python" "$OUT_DIR"/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/check-venv/bin/python" -c 'import importlib, sys; importlib.import_module(sys.argv[1])' "$IMPORT_NAME"
+
+      - name: Upload the distributions
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-dist-${{ matrix.project.index }}
+          path: dist/${{ matrix.project.index }}/*
+          if-no-files-found: error
+          overwrite: true
+
+  python-dist:
+    needs: python
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Download the distributions
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: python-dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Upload the merged distributions
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-dist
+          path: dist/*
+          if-no-files-found: error
+          overwrite: true
+
+  images:
+    needs: preflight
+    if: ${{ needs.preflight.outputs.images != '[]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        image: ${{ fromJSON(needs.preflight.outputs.images) }}
+    steps:
+      - name: Check out the caller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          cache-image: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Look up the image of this version
+        id: existing
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image.name }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          if digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{.Manifest.Digest}}' 2> "$RUNNER_TEMP/inspect.err"); then
+            echo "Reusing $IMAGE:$VERSION at $digest."
+            echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          # GHCR answers denied or 403 for a package that was never pushed.
+          elif grep -qiE 'not found|manifest unknown|name unknown|denied|403 Forbidden|unauthorized' "$RUNNER_TEMP/inspect.err"; then
+            echo "No image $IMAGE:$VERSION yet."
+          else
+            cat "$RUNNER_TEMP/inspect.err" >&2
+            echo "::error::Looking up $IMAGE:$VERSION failed."
+            exit 1
+          fi
+
+      - name: Build and push by digest
+        id: build
+        if: ${{ steps.existing.outputs.digest == '' }}
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.file }}
+          platforms: linux/amd64,linux/arm64
+          build-args: VERSION=${{ needs.preflight.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.preflight.outputs.version }}
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Check the reported version
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image.name }}
+          DIGEST: ${{ steps.existing.outputs.digest || steps.build.outputs.digest }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            reported=$(docker run --rm --platform "$platform" "$IMAGE@$DIGEST" version)
+            if [ "$reported" != "$VERSION" ]; then
+              echo "::error::$IMAGE@$DIGEST on $platform reports version '$reported', expected '$VERSION'."
+              exit 1
+            fi
+          done
+
+      - name: Write the digest
+        env:
+          NAME: ${{ matrix.image.name }}
+          DIGEST: ${{ steps.existing.outputs.digest || steps.build.outputs.digest }}
+        run: |
+          mkdir -p digests
+          printf '%s' "$DIGEST" > "digests/$NAME"
+
+      - name: Upload the digest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.image.name }}
+          path: digests/${{ matrix.image.name }}
+          if-no-files-found: error
+          overwrite: true
+
+  images-collect:
+    needs: [preflight, images]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.images.result) }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      images: ${{ steps.collect.outputs.images }}
+    steps:
+      - name: Download the digests
+        if: ${{ needs.images.result == 'success' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
+      - name: Collect the digests
+        id: collect
+        run: |
+          images=$(
+            for file in digests/*; do
+              [ -f "$file" ] || continue
+              jq -n --arg name "$(basename "$file")" --arg digest "$(cat "$file")" '{($name): $digest}'
+            done | jq -sc 'add // {}'
+          )
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+
+  tag:
+    needs: [preflight, python, python-dist, images, images-collect]
+    if: >-
+      ${{ !cancelled() && needs.preflight.result == 'success'
+      && contains(fromJSON('["success", "skipped"]'), needs.python.result)
+      && contains(fromJSON('["success", "skipped"]'), needs.python-dist.result)
+      && contains(fromJSON('["success", "skipped"]'), needs.images.result)
+      && contains(fromJSON('["success", "skipped"]'), needs.images-collect.result) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          if gh api -X POST "repos/$REPO/git/refs" -f ref="refs/tags/$TAG" -f sha="$SHA" > /dev/null; then
+            echo "Created $TAG on $SHA."
+            exit 0
+          fi
+          existing=$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq '"\(.object.type) \(.object.sha)"')
+          if [ "$existing" != "commit $SHA" ]; then
+            echo "::error::The tag $TAG already exists and does not point at $SHA ($existing)."
+            exit 1
+          fi
+          echo "The tag $TAG already points at $SHA."
