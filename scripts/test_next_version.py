@@ -83,6 +83,11 @@ def test_unknown_bump_fails():
         next_version([], [], "huge", False, "semver", TODAY)
 
 
+def test_calver_rejects_prerelease():
+    with pytest.raises(ValueError):
+        next_version(["v2026.10.3"], [], "", True, "calver", TODAY)
+
+
 @pytest.mark.parametrize(
     "junk", ["v1.2", "v01.2.3", "v1.2.3-rc.x", "v1.3.0-rc.007", "v1.3.0-rc.0", "v\u0661.2.3"]
 )

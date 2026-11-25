@@ -91,6 +91,8 @@ def next_version(
         raise ValueError(f"unknown scheme: {scheme}")
     tags = list(tags)
     if scheme == "calver":
+        if prerelease:
+            raise ValueError("calver releases have no release candidates")
         return _calver(tags, head_tags, today)
     if bump not in BUMPS:
         raise ValueError(f"unknown bump: {bump}")

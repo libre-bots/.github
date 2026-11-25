@@ -119,7 +119,28 @@ jobs:
         run: |
           tags=(-t "$IMAGE:$VERSION")
           if [ "$PRERELEASE" != "true" ]; then
-            tags+=(-t "$IMAGE:${VERSION%.*}" -t "$IMAGE:latest")
+            for floating in "${VERSION%.*}" latest; do
+              if ! config=$(docker buildx imagetools inspect "$IMAGE:$floating" --format '{{json .Image}}' 2> "$RUNNER_TEMP/inspect.err"); then
+                if ! grep -qiE 'not found|manifest unknown' "$RUNNER_TEMP/inspect.err"; then
+                  cat "$RUNNER_TEMP/inspect.err" >&2
+                  echo "::error::Looking up $IMAGE:$floating failed."
+                  exit 1
+                fi
+                tags+=(-t "$IMAGE:$floating")
+                continue
+              fi
+              current=$(jq -r '[if has("config") then . else .[] end | .config.Labels["org.opencontainers.image.version"] // empty]
+                | unique | if length == 1 then .[0] else "" end' <<< "$config")
+              if [ -z "$current" ]; then
+                echo "::error::$IMAGE:$floating has no single org.opencontainers.image.version label to compare $VERSION with."
+                exit 1
+              fi
+              if [ "$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | tail -n 1)" = "$VERSION" ]; then
+                tags+=(-t "$IMAGE:$floating")
+              else
+                echo "Leaving $IMAGE:$floating at $current, which is newer than $VERSION."
+              fi
+            done
           fi
           docker buildx imagetools create "${tags[@]}" "$IMAGE@$DIGEST"
 
