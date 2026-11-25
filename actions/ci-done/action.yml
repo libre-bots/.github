@@ -2,7 +2,7 @@ name: CI Done
 description: Passes only when at least one job is given and every job succeeded or was skipped; anything else fails.
 inputs:
   needs:
-    description: The needs context of the calling job, passed as ${{ toJSON(needs) }}.
+    description: The needs context of the calling job as JSON, from toJSON(needs).
     required: true
 runs:
   using: composite
