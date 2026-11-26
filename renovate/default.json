@@ -31,6 +31,11 @@
       "matchUpdateTypes": ["digest", "major", "minor", "patch"],
       "automerge": true,
       "platformAutomerge": true
+    },
+    {
+      "description": "Keep .python-version at the lowest supported Python, the version releases build and test with.",
+      "matchManagers": ["pyenv"],
+      "enabled": false
     }
   ]
 }
